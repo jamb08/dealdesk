@@ -352,6 +352,12 @@ select.inp{cursor:pointer;color:#0f172a;font-family:'Inter',sans-serif;font-size
 /* ── NOTES ── */
 .notes-note{display:inline-flex;align-items:center;gap:5px;background:#fffbeb;border:1px solid #fde68a;border-radius:5px;padding:3px 9px;font-family:'Inter',sans-serif;font-size:11px;color:#92400e;margin-top:5px;}
 
+@keyframes spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
+.url-inp{background:#f8fafc;border:1px solid #e2e8f0;color:#0f172a;font-family:'Inter',sans-serif;font-size:13px;padding:9px 12px;border-radius:7px;outline:none;transition:all .15s;}
+.url-inp:focus{border-color:#d97706;box-shadow:0 0 0 3px #d9770615;}
+.url-inp::placeholder{color:#94a3b8;}
+.btn-import{background:#0f172a;border:none;color:#fff;font-family:'Inter',sans-serif;font-size:12px;font-weight:600;padding:9px 16px;border-radius:7px;cursor:pointer;transition:background .15s;white-space:nowrap;}
+.btn-import:hover{background:#1e293b;}.btn-import:disabled{background:#94a3b8;cursor:not-allowed;}
 @media(max-width:900px){
   .mg4{grid-template-columns:1fr 1fr;}
   .db-hero{grid-template-columns:repeat(2,1fr);}
@@ -376,109 +382,196 @@ function Stars({ v, onChange }) {
 }
 
 // ─── SOURCE IMPORT PANEL ─────────────────────────────────────────────────────
+// Calls Anthropic API directly. PDF path is reliable. URL path uses web_search
+// tool — works best for open/indexed pages; many major portals (Rightmove,
+// Domain, Bayut) block scrapers so Claude searches for cached/indexed data
+// rather than loading the raw page. Results will vary by portal.
+
+async function callClaude(body) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    // Surface the actual API error message
+    const msg = data?.error?.message || `HTTP ${res.status} ${res.statusText}`;
+    throw new Error(msg);
+  }
+  if (data.type === "error") {
+    throw new Error(data.error?.message || "Unknown API error");
+  }
+  return data;
+}
+
+// Extract all text blocks from a response, handling tool_use multi-turn
+function extractText(data) {
+  if (!data?.content) return "";
+  return data.content
+    .filter(b => b.type === "text")
+    .map(b => b.text)
+    .join("\n")
+    .trim();
+}
+
+// For URL mode we may need to continue the conversation after tool_use turns
+async function runWithWebSearch(messages, maxTurns = 4) {
+  let msgs = [...messages];
+  let lastData = null;
+
+  for (let i = 0; i < maxTurns; i++) {
+    const data = await callClaude({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1500,
+      tools: [{ type: "web_search_20250305", name: "web_search" }],
+      messages: msgs,
+    });
+    lastData = data;
+
+    if (data.stop_reason === "end_turn") break;
+
+    // If the model used a tool, add its response and continue
+    if (data.stop_reason === "tool_use") {
+      const toolUseBlocks = data.content.filter(b => b.type === "tool_use");
+      if (!toolUseBlocks.length) break;
+      // Add assistant turn
+      msgs.push({ role: "assistant", content: data.content });
+      // Add tool results (web_search returns results automatically in this env)
+      msgs.push({
+        role: "user",
+        content: toolUseBlocks.map(tb => ({
+          type: "tool_result",
+          tool_use_id: tb.id,
+          content: tb.input?.query
+            ? `Web search completed for: "${tb.input.query}". Results have been retrieved.`
+            : "Web search completed.",
+        })),
+      });
+    } else {
+      break;
+    }
+  }
+  return lastData;
+}
+
+function parseFieldsJson(fullText) {
+  const marker = "FIELDS_JSON:";
+  const idx = fullText.lastIndexOf(marker);
+  if (idx === -1) return { analysis: fullText, fields: null };
+  const analysis = fullText.slice(0, idx).trim();
+  let fields = null;
+  try {
+    const raw = fullText.slice(idx + marker.length).trim().replace(/```json|```/g, "");
+    fields = JSON.parse(raw);
+  } catch {}
+  return { analysis, fields };
+}
+
 function SourceImportPanel({ deal, onAnalysisComplete, onFieldsExtracted }) {
-  const [srcTab,   setSrcTab]   = useState("pdf"); // pdf | url
-  const [pdfFile,  setPdfFile]  = useState(null);
-  const [pdfB64,   setPdfB64]   = useState(null);
-  const [url,      setUrl]      = useState(deal?.listingUrl || "");
-  const [loading,  setLoading]  = useState(false);
-  const [status,   setStatus]   = useState(null); // null | {ok, msg}
+  const [srcTab,  setSrcTab]  = useState("pdf");
+  const [pdfFile, setPdfFile] = useState(null);
+  const [pdfB64,  setPdfB64]  = useState(null);
+  const [url,     setUrl]     = useState(deal?.listingUrl || "");
+  const [loading, setLoading] = useState(false);
+  const [status,  setStatus]  = useState(null);
+  const [logLines,setLogLines]= useState([]);
   const fileRef = useRef();
+
+  const log = msg => setLogLines(p => [...p, msg]);
 
   const handleFile = e => {
     const f = e.target.files[0];
     if (!f) return;
-    setPdfFile(f);
+    if (f.size > 30 * 1024 * 1024) {
+      setStatus({ ok:false, msg:`PDF is ${(f.size/1024/1024).toFixed(1)} MB — please use a file under 30 MB.` });
+      return;
+    }
+    setPdfFile(f); setPdfB64(null); setStatus(null); setLogLines([]);
     const reader = new FileReader();
     reader.onload = ev => setPdfB64(ev.target.result.split(",")[1]);
+    reader.onerror = () => setStatus({ ok:false, msg:"Failed to read file. Please try again." });
     reader.readAsDataURL(f);
   };
 
   const run = async () => {
-    setLoading(true); setStatus(null);
-    const c = deal?.currency || "USD";
-    const mkt = deal?.market || "unknown market";
+    setLoading(true); setStatus(null); setLogLines([]);
+    const c   = deal?.currency || "USD";
+    const mkt = deal?.market   || "the relevant market";
+
+    const FIELDS_TEMPLATE = `{"address":"","market":"","type":"","currency":"${c}","purchasePrice":"","monthlyRent":"","serviceCharge":"","closingCosts":""}`;
+    const FIELDS_INSTRUCTION = `\n\nFinally, on a completely new line, write exactly: FIELDS_JSON: then immediately the JSON object (no markdown fences, no extra text):\nFIELDS_JSON:${FIELDS_TEMPLATE}`;
 
     try {
-      let messages;
-      if (srcTab === "pdf" && pdfB64) {
-        const prompt = `You are an expert property investment analyst. A property listing PDF has been provided.
+      let fullText = "";
 
-1. Extract all key data you can find: address, property type, market/city, asking price (in ${c}), estimated rental income, service charges, any fees, size (sqm/sqft), developer/agent details, completion date, and any other relevant investment facts.
+      // ── PDF PATH ────────────────────────────────────────────────────────────
+      if (srcTab === "pdf") {
+        if (!pdfB64) {
+          setStatus({ ok:false, msg:"No PDF loaded yet — please select a file first." });
+          setLoading(false); return;
+        }
+        log("Sending PDF to Claude…");
+        const prompt =
+          `You are an expert property investment analyst. The attached PDF is a property listing or brochure.\n\n` +
+          `Step 1 — Extract every piece of investment-relevant data you can find: full address, property type, market/city/country, asking price (numbers only, currency ${c}), any rental estimates, service charges, management fees, size (sqm/sqft), developer or agent name, completion or handover date.\n\n` +
+          `Step 2 — Write a thorough 3-paragraph investment appraisal: (a) yield potential and value versus comparable ${mkt} market rates (b) risks, red flags, anything missing (c) your verdict.\n\n` +
+          `Step 3 — End with: VERDICT: [Buy/Watch/Pass] — [one sentence]` +
+          FIELDS_INSTRUCTION;
 
-2. Write a thorough 3-paragraph investment appraisal covering: (a) yield potential and value assessment for the ${mkt} market (b) risks, red flags, or concerns (c) verdict.
+        const data = await callClaude({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1500,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "document", source: { type: "base64", media_type: "application/pdf", data: pdfB64 } },
+              { type: "text", text: prompt },
+            ],
+          }],
+        });
+        log("Response received.");
+        fullText = extractText(data);
 
-3. End with: "VERDICT: [Buy/Watch/Pass] — [one sentence reason]"
-
-Then on a new line output ONLY this JSON (no markdown, no backticks):
-FIELDS_JSON:{"address":"","market":"","type":"","currency":"${c}","purchasePrice":"","monthlyRent":"","serviceCharge":"","closingCosts":""}`;
-
-        messages = [{
-          role:"user",
-          content:[
-            { type:"document", source:{ type:"base64", media_type:"application/pdf", data:pdfB64 }},
-            { type:"text", text:prompt }
-          ]
-        }];
-      } else if (srcTab === "url" && url) {
-        const prompt = `You are an expert property investment analyst. Search for and review this property listing: ${url}
-
-1. Find and extract all key investment data: address, property type, market/city, asking price, estimated/achieved rental income, service charges, any known fees, size, developer/agent, completion date.
-
-2. Write a thorough 3-paragraph investment appraisal covering: (a) yield potential and value assessment for this market (b) risks, red flags, or concerns (c) verdict.
-
-3. End with: "VERDICT: [Buy/Watch/Pass] — [one sentence reason]"
-
-Then on a new line output ONLY this JSON (no markdown, no backticks):
-FIELDS_JSON:{"address":"","market":"","type":"","currency":"${c}","purchasePrice":"","monthlyRent":"","serviceCharge":"","closingCosts":""}`;
-
-        messages = [{ role:"user", content:prompt }];
+      // ── URL PATH ────────────────────────────────────────────────────────────
       } else {
-        setStatus({ ok:false, msg:"Please upload a PDF or enter a URL first." });
-        setLoading(false); return;
+        if (!url.trim()) {
+          setStatus({ ok:false, msg:"Please enter a URL first." });
+          setLoading(false); return;
+        }
+        log("Searching for property listing…");
+        const prompt =
+          `You are an expert property investment analyst. Use web search to find information about this property listing: ${url.trim()}\n\n` +
+          `Important: Many portals like Rightmove, Domain, and Bayut block direct scraping, so search for the address or property details that appear in Google's index from this URL instead.\n\n` +
+          `Step 1 — Find and extract: full address, property type, market/city/country, asking price, any rental estimates, service charges, fees, size, developer/agent, completion date.\n\n` +
+          `Step 2 — Write a thorough 3-paragraph investment appraisal: (a) yield potential and value for this market (b) risks, red flags, concerns (c) your verdict.\n\n` +
+          `Step 3 — End with: VERDICT: [Buy/Watch/Pass] — [one sentence]\n\n` +
+          `If the portal blocked access and you cannot retrieve specific listing details, say so clearly, then give a general market appraisal for the area based on what you know.` +
+          FIELDS_INSTRUCTION;
+
+        const data = await runWithWebSearch([{ role: "user", content: prompt }]);
+        log("Search complete. Processing response…");
+        fullText = extractText(data);
       }
 
-      const tools = srcTab === "url" ? [{ type:"web_search_20250305", name:"web_search" }] : undefined;
-
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body:JSON.stringify({
-          model:"claude-sonnet-4-20250514",
-          max_tokens:1200,
-          ...(tools ? { tools } : {}),
-          messages,
-        })
-      });
-
-      const data = await res.json();
-      const fullText = data.content
-        .filter(b => b.type === "text")
-        .map(b => b.text)
-        .join("\n");
-
-      // Split out analysis vs JSON
-      const jsonMarker = "FIELDS_JSON:";
-      const jsonIdx = fullText.lastIndexOf(jsonMarker);
-      let analysis = fullText;
-      let fields = null;
-
-      if (jsonIdx !== -1) {
-        analysis = fullText.slice(0, jsonIdx).trim();
-        try {
-          const raw = fullText.slice(jsonIdx + jsonMarker.length).trim();
-          fields = JSON.parse(raw);
-        } catch {}
+      if (!fullText) {
+        throw new Error("The API returned an empty response. This can happen if the PDF is image-only (scanned) with no readable text, or if the portal blocked access.");
       }
 
+      const { analysis, fields } = parseFieldsJson(fullText);
       onAnalysisComplete(analysis);
       if (fields) onFieldsExtracted(fields);
-      setStatus({ ok:true, msg: fields
-        ? "Analysis complete. Deal fields have been pre-filled — review and adjust as needed."
-        : "Analysis complete. Fill in the financial fields manually to calculate returns." });
 
-    } catch (e) {
-      setStatus({ ok:false, msg:"Something went wrong. Please try again." });
+      setStatus({
+        ok: true,
+        msg: fields
+          ? "✓ Analysis complete — deal fields pre-filled. Review and adjust the numbers below."
+          : "✓ Analysis written — some fields couldn't be extracted automatically. Fill in the financials below.",
+      });
+
+    } catch (err) {
+      console.error("[DealDesk import error]", err);
+      setStatus({ ok:false, msg:`Error: ${err.message}` });
     }
     setLoading(false);
   };
@@ -486,45 +579,340 @@ FIELDS_JSON:{"address":"","market":"","type":"","currency":"${c}","purchasePrice
   return (
     <div className="source-panel">
       <div className="source-hdr">
-        <div className="source-lbl">
-          <span>📄</span> Analyse from Listing
-        </div>
+        <div className="source-lbl"><span>📄</span> Analyse from Listing</div>
       </div>
       <div className="source-body">
-        <div style={{fontFamily:"Inter,sans-serif",fontSize:13,color:"#475569",marginBottom:12,lineHeight:1.5}}>
-          Upload a property brochure / floorplan PDF, or paste a portal link — Claude will extract key details and write an investment appraisal automatically.
+        <div style={{fontFamily:"Inter,sans-serif",fontSize:13,color:"#475569",marginBottom:12,lineHeight:1.6}}>
+          Upload a property PDF or paste a portal link and Claude will extract the key details and write a full investment appraisal.
+          <span style={{display:"block",marginTop:4,fontSize:12,color:"#94a3b8"}}>
+            ⚠️ Portal links: Claude searches for indexed listing data. Sites like Rightmove and Domain actively block direct scraping — if a portal blocks access, Claude will tell you clearly and give a market-level appraisal instead.
+          </span>
         </div>
+
         <div className="source-tabs">
-          <div className={`src-tab ${srcTab==="pdf"?"on":""}`} onClick={()=>setSrcTab("pdf")}>📄 PDF Upload</div>
-          <div className={`src-tab ${srcTab==="url"?"on":""}`} onClick={()=>setSrcTab("url")}>🔗 Portal Link</div>
+          <div className={`src-tab ${srcTab==="pdf"?"on":""}`} onClick={()=>{setSrcTab("pdf");setStatus(null);setLogLines([]);}}>📄 PDF Upload</div>
+          <div className={`src-tab ${srcTab==="url"?"on":""}`} onClick={()=>{setSrcTab("url");setStatus(null);setLogLines([]);}}>🔗 Portal Link</div>
         </div>
 
         {srcTab === "pdf" ? (
           <>
-            <input ref={fileRef} type="file" accept=".pdf" style={{display:"none"}} onChange={handleFile}/>
-            <div className={`upload-zone ${pdfFile?"has-file":""}`} onClick={()=>fileRef.current.click()}>
+            <input ref={fileRef} type="file" accept=".pdf,application/pdf" style={{display:"none"}} onChange={handleFile}/>
+            <div className={`upload-zone ${pdfFile?"has-file":""}`} onClick={()=>{fileRef.current.value="";fileRef.current.click();}}>
               <div className="upload-icon">{pdfFile ? "✅" : "📁"}</div>
-              <div className="upload-text">{pdfFile ? "PDF ready to analyse" : "Click to upload PDF"}</div>
-              <div className="upload-sub">Property brochure, OM, or listing PDF</div>
-              {pdfFile && <div className="upload-fname">{pdfFile.name}</div>}
+              <div className="upload-text">{pdfFile ? "PDF loaded — ready to analyse" : "Click to select a PDF"}</div>
+              <div className="upload-sub">Property brochure, listing PDF, or OM · Max 30 MB</div>
+              {pdfFile && <div className="upload-fname">{pdfFile.name} ({(pdfFile.size/1024).toFixed(0)} KB)</div>}
             </div>
           </>
         ) : (
-          <div className="url-row">
-            <input className="url-inp" placeholder="https://www.rightmove.co.uk/properties/... or any portal URL"
-              value={url} onChange={e=>setUrl(e.target.value)}/>
+          <div>
+            <input className="url-inp" placeholder="https://www.rightmove.co.uk/properties/123456 or any listing URL"
+              value={url} onChange={e=>{setUrl(e.target.value);setStatus(null);}}
+              style={{width:"100%",marginBottom:0}}/>
           </div>
         )}
 
-        <div style={{marginTop:12,display:"flex",alignItems:"center",gap:10}}>
-          <button className="btn-import" onClick={run} disabled={loading || (srcTab==="pdf"?!pdfB64:!url)}>
+        <div style={{marginTop:12,display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+          <button className="btn-import" onClick={run}
+            disabled={loading || (srcTab==="pdf" ? !pdfB64 : !url.trim())}>
             {loading ? "Analysing…" : "✦ Analyse Listing"}
           </button>
-          {loading && <span style={{fontFamily:"Inter,sans-serif",fontSize:12,color:"#94a3b8"}}>This may take 15–30 seconds…</span>}
+          {loading && (
+            <span style={{fontFamily:"Inter,sans-serif",fontSize:12,color:"#94a3b8"}}>
+              {logLines[logLines.length-1] || "Starting…"} — may take 20–40 s
+            </span>
+          )}
         </div>
+
         {status && (
-          <div className={`import-status ${status.ok?"ok":"err"}`}>
-            {status.ok ? "✓" : "✕"} {status.msg}
+          <div className={`import-status ${status.ok?"ok":"err"}`} style={{marginTop:10,whiteSpace:"pre-wrap",lineHeight:1.5}}>
+            {status.msg}
+            {!status.ok && (
+              <div style={{marginTop:6,fontSize:11,color:"inherit",opacity:.8}}>
+                Check the browser console (F12 → Console) for the full error detail.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── MARKET INTELLIGENCE TAB ─────────────────────────────────────────────────
+function MarketIntelTab({ deal }) {
+  const [intel,    setIntel]    = useState(deal.marketIntel || null);
+  const [loading,  setLoading]  = useState(false);
+  const [error,    setError]    = useState(null);
+
+  const run = async () => {
+    if (!deal.market && !deal.address) {
+      setError("Add a market / city to this deal first so Claude knows where to research.");
+      return;
+    }
+    setLoading(true); setError(null);
+    const location = deal.market || deal.address;
+    const type     = deal.type   || "residential property";
+    const prompt =
+      `You are a property market research analyst. Use web search to find current data for: ${location}\n\n` +
+      `Research and report on ALL of the following, citing sources where possible:\n\n` +
+      `1. RENTAL YIELDS — Current average gross and net rental yields for ${type} in ${location}. Include specific suburb/district breakdowns if available.\n\n` +
+      `2. PRICE TRENDS — Property price changes over the last 12 months and 3 years. Are prices rising, falling, or flat?\n\n` +
+      `3. RENTAL DEMAND — Vacancy rates, rental price growth, demand drivers (expats, students, corporates etc).\n\n` +
+      `4. COMPARABLE TRANSACTIONS — Any recent comparable sales or listings for ${type} in this area with prices.\n\n` +
+      `5. MARKET OUTLOOK — Key risks and tailwinds for investors in the next 1–3 years. Oversupply concerns? Infrastructure? Regulation changes?\n\n` +
+      `6. INVESTOR VERDICT — Given all of the above, rate ${location} as an investment market: Strong / Neutral / Caution, with a 2-sentence rationale.\n\n` +
+      `Format each section with a clear heading. Be specific with numbers wherever you can find them.`;
+
+    try {
+      const data = await runWithWebSearch([{ role:"user", content:prompt }]);
+      const text = extractText(data);
+      if (!text) throw new Error("Empty response from API.");
+      setIntel(text);
+    } catch(e) {
+      setError(`Error: ${e.message}`);
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div className="sv">
+      <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,overflow:"hidden",boxShadow:"0 1px 3px rgba(0,0,0,.04)",marginBottom:20}}>
+        <div style={{padding:"12px 18px",background:"#f8fafc",borderBottom:"1px solid #e2e8f0",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <div style={{fontFamily:"Inter,sans-serif",fontSize:11,fontWeight:700,color:"#475569",letterSpacing:".06em",textTransform:"uppercase",display:"flex",alignItems:"center",gap:8}}>
+            <span>🌐</span> Live Market Research
+          </div>
+          <button className="btn-ai" onClick={run} disabled={loading}
+            style={{background:loading?"#fcd34d":"#0f172a",color:loading?"#92400e":"#fff"}}>
+            {loading ? "Researching…" : intel ? "↻ Refresh" : "Research Market"}
+          </button>
+        </div>
+        <div style={{padding:"14px 18px",fontFamily:"Inter,sans-serif",fontSize:13,color:"#475569",lineHeight:1.6}}>
+          {!intel && !loading && !error && (
+            <>
+              <p>Click <strong>Research Market</strong> to search the web for live data on <strong>{deal.market || deal.address || "this market"}</strong>, including:</p>
+              <ul style={{marginTop:8,paddingLeft:20,display:"flex",flexDirection:"column",gap:3}}>
+                {["Current rental yields & vacancy rates","Recent price trends (12m & 3yr)","Comparable transactions","Rental demand drivers","Market outlook & risks"].map(x=>(
+                  <li key={x} style={{fontSize:12,color:"#64748b"}}>{x}</li>
+                ))}
+              </ul>
+            </>
+          )}
+          {loading && (
+            <div style={{display:"flex",alignItems:"center",gap:10,color:"#94a3b8"}}>
+              <span style={{fontSize:18,animation:"spin 1s linear infinite",display:"inline-block"}}>⟳</span>
+              Searching the web for {deal.market || deal.address} market data… this takes 20–40 seconds.
+            </div>
+          )}
+          {error && <div style={{color:"#991b1b",background:"#fef2f2",border:"1px solid #fca5a5",borderRadius:6,padding:"10px 14px",fontSize:12}}>{error}</div>}
+          {intel && !loading && (
+            <div style={{whiteSpace:"pre-wrap",lineHeight:1.8,color:"#1e293b",fontSize:14}}>{intel}</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── QUICK IMPORT MODAL ───────────────────────────────────────────────────────
+// Lets users create a new deal by importing from PDF or URL, skipping the manual form
+function QuickImportModal({ onDealCreated, onClose }) {
+  const BLANK = {
+    address:"",market:"",type:"Apartment — 2BR",currency:"USD",listingUrl:"",notes:"",
+    purchasePrice:"",closingCosts:"",downPaymentPct:"20",mortgageRate:"5.5",mortgageTerm:"25",
+    monthlyRent:"",serviceCharge:"",insurance:"",mgmtFeePct:"8",maintenance:"",
+    appreciationRate:"5",status:"new",comments:[],aiAnalysis:null,
+  };
+  const [mode,     setMode]    = useState("choose"); // choose | pdf | url | form
+  const [draft,    setDraft]   = useState(BLANK);
+  const [pdfFile,  setPdfFile] = useState(null);
+  const [pdfB64,   setPdfB64]  = useState(null);
+  const [url,      setUrl]     = useState("");
+  const [loading,  setLoading] = useState(false);
+  const [status,   setStatus]  = useState(null);
+  const fileRef = useRef();
+
+  const handleFile = e => {
+    const f = e.target.files[0]; if(!f) return;
+    if(f.size > 30*1024*1024){ setStatus({ok:false,msg:"File over 30 MB — please use a smaller PDF."}); return; }
+    setPdfFile(f); setPdfB64(null); setStatus(null);
+    const r = new FileReader();
+    r.onload = ev => setPdfB64(ev.target.result.split(",")[1]);
+    r.readAsDataURL(f);
+  };
+
+  const runImport = async () => {
+    setLoading(true); setStatus(null);
+    const FIELDS_TEMPLATE = `{"address":"","market":"","type":"Apartment — 2BR","currency":"USD","purchasePrice":"","monthlyRent":"","serviceCharge":"","closingCosts":"","notes":""}`;
+    const FIELDS_INSTRUCTION = `\n\nOn a new line write exactly:\nFIELDS_JSON:${FIELDS_TEMPLATE}`;
+    const basePrompt =
+      `You are an expert property investment analyst.\n\n` +
+      `Step 1 — Extract: full address, property type, city/country, asking price, any rental estimate, service charges, completion date, developer/agent.\n\n` +
+      `Step 2 — Write a 3-paragraph investment appraisal: (a) yield potential (b) risks & red flags (c) verdict.\n\n` +
+      `Step 3 — End with VERDICT: [Buy/Watch/Pass] — [one sentence]` +
+      FIELDS_INSTRUCTION;
+
+    try {
+      let data;
+      if (mode === "pdf") {
+        if (!pdfB64) { setStatus({ok:false,msg:"Please select a PDF first."}); setLoading(false); return; }
+        data = await callClaude({
+          model:"claude-sonnet-4-20250514", max_tokens:1500,
+          messages:[{ role:"user", content:[
+            {type:"document",source:{type:"base64",media_type:"application/pdf",data:pdfB64}},
+            {type:"text",text:basePrompt},
+          ]}],
+        });
+      } else {
+        if (!url.trim()) { setStatus({ok:false,msg:"Please enter a URL first."}); setLoading(false); return; }
+        data = await runWithWebSearch([{ role:"user", content:
+          `You are an expert property investment analyst. Search for this listing: ${url.trim()}\n\n${basePrompt}` }]);
+      }
+
+      const fullText = extractText(data);
+      if (!fullText) throw new Error("Empty response. Try a different source.");
+      const { analysis, fields } = parseFieldsJson(fullText);
+
+      const merged = { ...BLANK, aiAnalysis:analysis };
+      if (fields) {
+        if (fields.address)       merged.address       = fields.address;
+        if (fields.market)        merged.market        = fields.market;
+        if (fields.type)          merged.type          = fields.type;
+        if (fields.currency)      merged.currency      = fields.currency;
+        if (fields.purchasePrice) merged.purchasePrice = fields.purchasePrice;
+        if (fields.monthlyRent)   merged.monthlyRent   = fields.monthlyRent;
+        if (fields.serviceCharge) merged.serviceCharge = fields.serviceCharge;
+        if (fields.closingCosts)  merged.closingCosts  = fields.closingCosts;
+        if (fields.notes)         merged.notes         = fields.notes;
+      }
+      merged.listingUrl = mode === "url" ? url.trim() : "";
+      setDraft(merged);
+      setMode("form");
+      setStatus({ok:true, msg:fields ? "Fields extracted — review & save below." : "Analysis complete — fill in financials below."});
+    } catch(e) {
+      setStatus({ok:false, msg:`Error: ${e.message}`});
+    }
+    setLoading(false);
+  };
+
+  const s = (k,v) => setDraft(p=>({...p,[k]:v}));
+
+  return (
+    <div className="mo" onClick={onClose}>
+      <div className="md" style={{maxWidth:660}} onClick={e=>e.stopPropagation()}>
+        <div className="md-title">
+          {mode==="choose" ? "Add Deal" : mode==="form" ? "Review & Save Deal" : mode==="pdf" ? "Import from PDF" : "Import from Portal Link"}
+        </div>
+
+        {/* CHOOSE MODE */}
+        {mode==="choose" && (
+          <div>
+            <p style={{fontFamily:"Inter,sans-serif",fontSize:14,color:"#475569",marginBottom:18,lineHeight:1.6}}>
+              How would you like to add this deal?
+            </p>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:12,marginBottom:8}}>
+              {[
+                {icon:"📄",title:"Upload PDF",sub:"Brochure or OM",action:()=>setMode("pdf")},
+                {icon:"🔗",title:"Portal Link",sub:"Rightmove, Bayut…",action:()=>setMode("url")},
+                {icon:"✏️",title:"Enter Manually",sub:"Fill in yourself",action:()=>setMode("form")},
+              ].map(opt=>(
+                <button key={opt.title} onClick={opt.action}
+                  style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:"20px 12px",cursor:"pointer",textAlign:"center",transition:"all .15s",fontFamily:"Inter,sans-serif"}}
+                  onMouseEnter={e=>{e.currentTarget.style.borderColor="#d97706";e.currentTarget.style.background="#fffbeb";}}
+                  onMouseLeave={e=>{e.currentTarget.style.borderColor="#e2e8f0";e.currentTarget.style.background="#f8fafc";}}>
+                  <div style={{fontSize:28,marginBottom:8}}>{opt.icon}</div>
+                  <div style={{fontSize:13,fontWeight:600,color:"#0f172a"}}>{opt.title}</div>
+                  <div style={{fontSize:11,color:"#94a3b8",marginTop:3}}>{opt.sub}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* PDF MODE */}
+        {mode==="pdf" && (
+          <div>
+            <input ref={fileRef} type="file" accept=".pdf,application/pdf" style={{display:"none"}} onChange={handleFile}/>
+            <div className={`upload-zone ${pdfFile?"has-file":""}`} style={{marginBottom:14}} onClick={()=>{fileRef.current.value="";fileRef.current.click();}}>
+              <div className="upload-icon">{pdfFile?"✅":"📁"}</div>
+              <div className="upload-text">{pdfFile?"PDF loaded — ready to analyse":"Click to select a PDF"}</div>
+              <div className="upload-sub">Property brochure, listing PDF · Max 30 MB</div>
+              {pdfFile&&<div className="upload-fname">{pdfFile.name}</div>}
+            </div>
+            {status&&<div className={`import-status ${status.ok?"ok":"err"}`} style={{marginBottom:12}}>{status.msg}</div>}
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+              <button className="btn-cancel" onClick={()=>{setMode("choose");setStatus(null);}}>← Back</button>
+              <button className="btn-import" onClick={runImport} disabled={loading||!pdfB64}>{loading?"Analysing…":"✦ Analyse PDF"}</button>
+            </div>
+          </div>
+        )}
+
+        {/* URL MODE */}
+        {mode==="url" && (
+          <div>
+            <div style={{fontFamily:"Inter,sans-serif",fontSize:12,color:"#64748b",marginBottom:10,lineHeight:1.6,background:"#fefce8",border:"1px solid #fde68a",borderRadius:6,padding:"10px 12px"}}>
+              ⚠️ Works best on open portals. Rightmove, Domain and Bayut block direct scraping — Claude will search Google for cached data from the URL instead.
+            </div>
+            <input className="url-inp" style={{width:"100%",marginBottom:14}}
+              placeholder="https://www.propertyportal.com/listing/123456"
+              value={url} onChange={e=>{setUrl(e.target.value);setStatus(null);}}/>
+            {status&&<div className={`import-status ${status.ok?"ok":"err"}`} style={{marginBottom:12}}>{status.msg}</div>}
+            <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+              <button className="btn-cancel" onClick={()=>{setMode("choose");setStatus(null);}}>← Back</button>
+              <button className="btn-import" onClick={runImport} disabled={loading||!url.trim()}>{loading?"Analysing…":"✦ Analyse Link"}</button>
+            </div>
+          </div>
+        )}
+
+        {/* FORM MODE */}
+        {mode==="form" && (
+          <div>
+            {status&&<div className={`import-status ${status.ok?"ok":"err"}`} style={{marginBottom:14}}>{status.msg}</div>}
+            {draft.aiAnalysis&&(
+              <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,padding:"12px 14px",marginBottom:14,fontSize:13,lineHeight:1.7,color:"#44403c",maxHeight:160,overflowY:"auto",whiteSpace:"pre-wrap"}}>
+                {draft.aiAnalysis}
+              </div>
+            )}
+            <div className="md-grid">
+              <div className="inp-g md-full"><div className="inp-l">Property Address</div>
+                <input className="inp" value={draft.address} onChange={e=>s("address",e.target.value)} placeholder="Full address"/></div>
+              <div className="inp-g"><div className="inp-l">Market / City</div>
+                <input className="inp" value={draft.market} onChange={e=>s("market",e.target.value)} placeholder="e.g. Dubai, London"/></div>
+              <div className="inp-g"><div className="inp-l">Currency</div>
+                <select className="inp" value={draft.currency} onChange={e=>s("currency",e.target.value)}>
+                  {Object.values(CURRENCIES).map(c=><option key={c.code} value={c.code}>{c.flag} {c.code} — {c.name}</option>)}
+                </select></div>
+              <div className="inp-g"><div className="inp-l">Property Type</div>
+                <select className="inp" value={draft.type} onChange={e=>s("type",e.target.value)}>
+                  {DEAL_TYPES.map(t=><option key={t}>{t}</option>)}
+                </select></div>
+              <div className="inp-g"><div className="inp-l">Status</div>
+                <select className="inp" value={draft.status} onChange={e=>s("status",e.target.value)}>
+                  {STATUSES.map(x=><option key={x.v} value={x.v}>{x.l}</option>)}
+                </select></div>
+              <div className="md-div">Acquisition</div>
+              {[["purchasePrice","Purchase Price"],["closingCosts","Closing Costs"],["downPaymentPct","Down Payment %"],["mortgageRate","Rate %"],["mortgageTerm","Term (yrs)"]].map(([k,l])=>(
+                <div className="inp-g" key={k}><div className="inp-l">{l}</div>
+                  <input className="inp" type="number" value={draft[k]} onChange={e=>s(k,e.target.value)}/></div>
+              ))}
+              <div className="md-div">Income & Monthly Expenses</div>
+              {[["monthlyRent","Monthly Rent"],["serviceCharge","Service / Strata"],["insurance","Insurance"],["mgmtFeePct","Mgmt Fee %"],["maintenance","Maintenance"]].map(([k,l])=>(
+                <div className="inp-g" key={k}><div className="inp-l">{l}</div>
+                  <input className="inp" type="number" value={draft[k]} onChange={e=>s(k,e.target.value)}/></div>
+              ))}
+              <div className="md-div">Growth</div>
+              <div className="inp-g"><div className="inp-l">Annual Capital Growth %</div>
+                <input className="inp" type="number" value={draft.appreciationRate} onChange={e=>s("appreciationRate",e.target.value)}/></div>
+              <div className="inp-g md-full"><div className="inp-l">Notes</div>
+                <input className="inp" value={draft.notes||""} onChange={e=>s("notes",e.target.value)} placeholder="Any quick notes"/></div>
+            </div>
+          </div>
+        )}
+
+        {mode==="form"&&(
+          <div className="md-acts">
+            <button className="btn-cancel" onClick={onClose}>Cancel</button>
+            <button className="btn-save" onClick={()=>onDealCreated({...draft,id:String(Date.now())})}>Save Deal</button>
           </div>
         )}
       </div>
@@ -819,6 +1207,43 @@ function Dashboard({ deals }) {
           </div>
         </div>
       </div>
+      {/* CUMULATIVE CASH FLOW CHART */}
+      {mx.length > 0 && (
+        <div style={{marginBottom:20}}>
+          <div className="sh">Portfolio — 5-Year Cumulative Cash Flow Projection</div>
+          <div className="chart-box">
+            <ResponsiveContainer width="100%" height={200}>
+              <AreaChart
+                data={Array.from({length:60},(_,i)=>({
+                  mo: `Mo ${i+1}`,
+                  cf: mx.reduce((s,{m})=>s+(m.cf*(i+1)),0),
+                }))}
+                margin={{top:4,right:8,bottom:4,left:8}}>
+                <defs>
+                  <linearGradient id="cfGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%"  stopColor="#10b981" stopOpacity={0.25}/>
+                    <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9"/>
+                <XAxis dataKey="mo" tick={{fill:"#94a3b8",fontSize:9,fontFamily:"Inter,sans-serif"}}
+                  tickFormatter={v=>{ const n=parseInt(v.split(" ")[1]); return n%12===0?`Yr ${n/12}`:""; }}
+                  axisLine={{stroke:"#e2e8f0"}} tickLine={false}/>
+                <YAxis tick={{fill:"#94a3b8",fontSize:9,fontFamily:"Inter,sans-serif"}} axisLine={false} tickLine={false}
+                  tickFormatter={v=>v>=1e6?`${(v/1e6).toFixed(1)}M`:v>=1e3?`${(v/1e3).toFixed(0)}K`:v}/>
+                <Tooltip contentStyle={TT_STYLE}
+                  formatter={v=>[Math.round(v).toLocaleString()+" (mixed ccy)","Cumulative CF"]}
+                  labelFormatter={l=>l}/>
+                <Area type="monotone" dataKey="cf" stroke="#10b981" fill="url(#cfGrad)" strokeWidth={2.5} dot={false} name="Cumulative CF"/>
+              </AreaChart>
+            </ResponsiveContainer>
+            <div style={{fontFamily:"Inter,sans-serif",fontSize:11,color:"#94a3b8",textAlign:"center",marginTop:4}}>
+              Cumulative monthly cash flows summed across all active deals · Mixed currencies — for directional indication only
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="sh">All Deals</div>
       <div style={{background:"#fff",borderRadius:10,overflow:"hidden",border:"1px solid #e2e8f0",boxShadow:"0 1px 3px rgba(0,0,0,.04)"}}>
         <div style={{overflowX:"auto"}}>
@@ -860,8 +1285,9 @@ export default function App() {
   const [tab,     setTab]     = useState("overview");
   const [cmpMode, setCmpMode] = useState(false);
   const [cmpIds,  setCmpIds]  = useState([]);
-  const [modal,   setModal]   = useState(false);
-  const [editD,   setEditD]   = useState(null);
+  const [modal,      setModal]      = useState(false);
+  const [editD,      setEditD]      = useState(null);
+  const [quickImport,setQuickImport]= useState(false);
   const [aiLoad,  setAiLoad]  = useState(false);
   const [cmt,     setCmt]     = useState({author:"Chris",text:"",score:4});
   const [search,  setSearch]  = useState("");
@@ -1053,6 +1479,7 @@ export default function App() {
   const dealTabs = sel&&!cmpMode ? [
     {k:"overview",l:"Overview"},
     {k:"growth",  l:"Growth"},
+    {k:"market",  l:"Market Intel"},
     {k:"notes",   l:`Notes (${(sel.comments||[]).length})`},
   ] : [];
 
@@ -1061,6 +1488,7 @@ export default function App() {
     if (cmpMode)           return <CompareView deals={deals} cmpIds={cmpIds}/>;
     if (!sel)              return <div className="m-empty"><div className="empty-i">◆</div><div className="empty-t">No deal selected</div><div className="empty-s">Choose a deal or add a new one</div></div>;
     if (tab==="growth")    return <GrowthTab deal={sel} onUpdate={upd}/>;
+    if (tab==="market")    return <MarketIntelTab deal={sel}/>;
     if (tab==="notes")     return <NotesContent/>;
     return <OverviewContent/>;
   };
@@ -1079,7 +1507,7 @@ export default function App() {
             <input className="search-inp" placeholder="🔍  Search deals…" value={search} onChange={e=>setSearch(e.target.value)}/>
           </div>
           <div className="sb-acts">
-            <button className="btn-add" onClick={()=>{setEditD(null);setModal(true);}}>+ Add Deal</button>
+            <button className="btn-add" onClick={()=>setQuickImport(true)}>+ Add Deal</button>
             <button className={`btn-sm ${tab==="dashboard"&&!cmpMode?"on":""}`} onClick={()=>{setTab("dashboard");setCmpMode(false);}}>Dashboard</button>
             <button className={`btn-sm ${cmpMode?"on":""}`} onClick={()=>{setCmpMode(p=>!p);if(!cmpMode)setTab("overview");}}>
               {cmpMode?"✓ Cmp":"⇄ Cmp"}
@@ -1125,6 +1553,10 @@ export default function App() {
         </div>
       </div>
       {modal&&<DealModal deal={editD} onSave={saveDeal} onClose={()=>{setModal(false);setEditD(null);}}/>}
+      {quickImport&&<QuickImportModal
+        onDealCreated={d=>{ saveDeal(d); setQuickImport(false); setTab("overview"); }}
+        onClose={()=>setQuickImport(false)}
+      />}
     </>
   );
 }
